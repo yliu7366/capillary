@@ -12,49 +12,36 @@ import multiprocessing
 # --- Configuration (Defaults, can be overridden by CLI) ---
 DEFAULT_BLOCK_SIZE = 128
 DEFAULT_OVERLAP_PIXELS = 16
-DEFAULT_NUM_CORES = 24
 DEFAULT_SAVE_INTERMEDIATES = False
 DEFAULT_GLOBAL_INTENSITY_THRESH = 100
 
-# Frangi parameters (Targeting bright structures, e.g., walls or vessels)
-FRANGI_SCALE_RANGE = (1, 2) 
+FRANGI_SCALE_RANGE = (1, 2)
 FRANGI_SCALE_STEP = 1
 FRANGI_BETA1 = 0.5
 FRANGI_BETA2 = 15
 
-# Pre-processing
 PRE_SMOOTHING_SIGMA_PIXELS = 0.5
 
-# Segmentation
 DEFAULT_THRESHOLD_METHOD = 'hysteresis'
 DEFAULT_HYSTERESIS_LOW = 0.05
 DEFAULT_HYSTERESIS_HIGH = 0.15
 DEFAULT_FIXED_THRESHOLD_VALUE = 0.1
 
-# Post-processing
 MIN_OBJECT_SIZE_VOXELS = 50
 OPENING_RADIUS_PIXELS = 0
 
 # ==============================================================================
 # TOP-LEVEL FUNCTIONS FOR MULTIPROCESSING
 # ==============================================================================
-
+# process_single_3d_block_mp remains the same
 def process_single_3d_block_mp(input_block_data_with_overlap, params_dict):
-    """
-    Processes a single 3D block: Frangi, thresholding, post-processing.
-    No inversion is performed. Input block is assumed to be globally preprocessed.
-    Returns a tuple: (final_binary_segmentation, frangi_enhanced_block_calibrated)
-    """
-    # Unpack parameters
     frangi_scales = params_dict['frangi_scales']
     frangi_beta1 = params_dict['frangi_beta1']
     frangi_beta2 = params_dict['frangi_beta2']
-    
     threshold_method_val = params_dict['threshold_method_val']
     hysteresis_low_val = params_dict['hysteresis_low']
     hysteresis_high_val = params_dict['hysteresis_high']
     fixed_threshold_val = params_dict['fixed_threshold']
-
     opening_radius = params_dict['opening_radius']
     min_obj_size = params_dict['min_obj_size']
     
@@ -65,12 +52,9 @@ def process_single_3d_block_mp(input_block_data_with_overlap, params_dict):
     else:
         frangi_input = processed_block
 
-    # Vessel Enhancement Filter (Frangi)
     enhanced_block_raw_frangi = frangi(
-        frangi_input,
-        sigmas=frangi_scales,
-        alpha=0.5, beta=frangi_beta1, gamma=frangi_beta2,
-        black_ridges=False # Target bright structures
+        frangi_input, sigmas=frangi_scales, alpha=0.5, 
+        beta=frangi_beta1, gamma=frangi_beta2, black_ridges=False
     )
     if enhanced_block_raw_frangi.dtype != np.float32:
         enhanced_block_raw_frangi = enhanced_block_raw_frangi.astype(np.float32)
@@ -104,14 +88,12 @@ def process_single_3d_block_mp(input_block_data_with_overlap, params_dict):
         binary_block = remove_small_objects(binary_block.astype(bool), min_size=min_obj_size).astype(np.uint8)
     
     final_block_segmentation = binary_block
-    
     return final_block_segmentation, enhanced_block_calibrated
-
 # ==============================================================================
 
 # --- Main Segmentation Function ---
 def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: str,
-                                  block_size_val: int, overlap_val: int, num_cores_val: int,
+                                  block_size_val: int, overlap_val: int, num_cores_to_use_for_pool: int,
                                   save_intermediates_flag: bool,
                                   global_intensity_threshold_val: int,
                                   arg_threshold_method: str,
@@ -120,6 +102,7 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
                                   arg_fixed_threshold: float,
                                   skeleton_output_path: str = None):
     
+    # ... (Initial printouts and setup as before) ...
     print(f"Starting capillary segmentation for: {input_volume_path}")
     print(f"  Output will be saved to: {output_volume_path}")
     if skeleton_output_path:
@@ -132,15 +115,13 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
         print(f"    Fixed Threshold: {arg_fixed_threshold}")
     print(f"  Processing with 3D blocks: {block_size_val}^3 pixels")
     print(f"  Overlap: {overlap_val} pixels")
-    print(f"  Number of CPU cores to use: {num_cores_val}")
+    print(f"  Number of CPU cores for worker pool: {num_cores_to_use_for_pool}")
     print(f"  Save intermediate steps: {save_intermediates_flag}")
-
     start_time_total = time.time()
     input_basename = os.path.splitext(os.path.basename(input_volume_path))[0]
     output_dir_main = os.path.dirname(output_volume_path)
     if not output_dir_main: output_dir_main = "."
     os.makedirs(output_dir_main, exist_ok=True)
-    
     output_dir_inter_skel = output_dir_main
     if skeleton_output_path:
         skel_dir = os.path.dirname(skeleton_output_path)
@@ -157,7 +138,6 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
         return
     load_time = time.time()
     print(f"Input volume shape (ZYX): {original_volume_zyx.shape}, dtype: {original_volume_zyx.dtype}. Loaded in {load_time - start_time_total:.2f}s.")
-
     working_volume = original_volume_zyx.astype(np.float32, copy=True)
 
     if global_intensity_threshold_val >= 0:
@@ -177,7 +157,7 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
             inter_path = os.path.join(output_dir_inter_skel, f"{input_basename}_02_smoothed.tif")
             print(f"  Saving smoothed volume to: {inter_path}")
             tifffile.imwrite(inter_path, working_volume.astype(np.float32), imagej=True)
-
+    
     output_volume_zyx = np.zeros_like(original_volume_zyx, dtype=np.uint8)
     if save_intermediates_flag:
         full_frangi_response_volume = np.zeros_like(working_volume, dtype=np.float32)
@@ -221,10 +201,8 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
     print(f"Total number of 3D blocks to process: {num_blocks}")
 
     shared_processing_params = {
-        # 'perform_inversion': False, # Removed as it's always False
         'frangi_scales': range(FRANGI_SCALE_RANGE[0], FRANGI_SCALE_RANGE[1] + 1, FRANGI_SCALE_STEP),
         'frangi_beta1': FRANGI_BETA1, 'frangi_beta2': FRANGI_BETA2,
-        # 'frangi_black_ridges' is hardcoded to False in process_single_3d_block_mp
         'threshold_method_val': arg_threshold_method,
         'hysteresis_low': arg_hysteresis_low,
         'hysteresis_high': arg_hysteresis_high,
@@ -232,22 +210,22 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
         'opening_radius': OPENING_RADIUS_PIXELS,
         'min_obj_size': MIN_OBJECT_SIZE_VOXELS,
     }
-    
     starmap_args = [(bi['input_data'], shared_processing_params) for bi in block_info_list_for_workers]
-
     processing_start_time = time.time()
-    if num_cores_val > 1 and num_blocks > 1:
-        print(f"Processing {num_blocks} blocks in parallel using {num_cores_val} cores...")
-        with multiprocessing.Pool(processes=num_cores_val) as pool:
+
+    if num_cores_to_use_for_pool > 1 and num_blocks > 1 :
+        print(f"Processing {num_blocks} blocks in parallel using {num_cores_to_use_for_pool} worker processes...")
+        with multiprocessing.Pool(processes=num_cores_to_use_for_pool) as pool:
             results_from_workers = pool.starmap(process_single_3d_block_mp, starmap_args)
     else:
-        print(f"Processing {num_blocks} blocks sequentially...")
+        if num_cores_to_use_for_pool == 1 : print(f"Processing {num_blocks} blocks sequentially (1 core requested/available for pool)...")
+        else: print(f"Processing {num_blocks} blocks sequentially (single block or no blocks)...")
         results_from_workers = []
         for i, (block_data, params_dict) in enumerate(starmap_args):
             if (i + 1) % (max(1, num_blocks // 10 if num_blocks >=10 else 1)) == 0 or i == num_blocks -1 :
                  print(f"  Processing block {i+1}/{num_blocks}...")
             results_from_workers.append(process_single_3d_block_mp(block_data, params_dict))
-
+    
     processing_time = time.time() - processing_start_time
     print(f"All blocks processed in {processing_time:.2f}s.")
 
@@ -272,7 +250,8 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
         print("Performing 3D skeletonization on the final segmented volume...")
         try:
             skeleton_start_time = time.time()
-            skeleton_volume = skeletonize(output_volume_zyx.astype(bool))
+            # Use skimage.morphology.skeletonize for 3D data
+            skeleton_volume = skeletonize(output_volume_zyx.astype(bool)) # Changed here
             skeleton_volume_uint8 = skeleton_volume.astype(np.uint8) * 255
             skeleton_time = time.time() - skeleton_start_time
             print(f"Skeletonization complete in {skeleton_time:.2f}s.")
@@ -298,13 +277,21 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
 
 # --- Main Execution ---
 def main():
+    try:
+        available_cores_total = len(os.sched_getaffinity(0))
+    except AttributeError:
+        print("Warning: os.sched_getaffinity not available. Falling back to multiprocessing.cpu_count().")
+        available_cores_total = multiprocessing.cpu_count()
+    default_pool_cores = max(1, available_cores_total - 1)
+
     parser = argparse.ArgumentParser(description="Capillary vessel segmentation with 3D block processing.")
     parser.add_argument("--input", type=str, required=True, help="Path to input 3D TIFF.")
     parser.add_argument("--output", type=str, required=True, help="Path to save output segmentation TIFF.")
     parser.add_argument("--skeleton_output", type=str, default=None, help="Optional: Path to save skeleton TIFF.")
     parser.add_argument("--block_size", type=int, default=DEFAULT_BLOCK_SIZE, help=f"Block size. Default: {DEFAULT_BLOCK_SIZE}")
     parser.add_argument("--overlap", type=int, default=DEFAULT_OVERLAP_PIXELS, help=f"Overlap pixels. Default: {DEFAULT_OVERLAP_PIXELS}")
-    parser.add_argument("--cores", type=int, default=DEFAULT_NUM_CORES, help=f"CPU cores. Default: {DEFAULT_NUM_CORES}")
+    parser.add_argument("--cores", type=int, default=default_pool_cores,
+                        help=f"CPU cores for worker pool. Default: {default_pool_cores} (available_total-1 or 1)")
     parser.add_argument("--save_intermediates", action='store_true', default=DEFAULT_SAVE_INTERMEDIATES, help="Save intermediates. Default: False")
     parser.add_argument("--global_intensity_thresh", type=int, default=DEFAULT_GLOBAL_INTENSITY_THRESH,
                         help=f"Global intensity threshold (pixels < thresh set to 0). -1 to disable. Default: {DEFAULT_GLOBAL_INTENSITY_THRESH}")
@@ -316,21 +303,21 @@ def main():
 
     args = parser.parse_args()
 
-    total_cpus = multiprocessing.cpu_count()
-    if total_cpus <= 1:
-        num_cores_to_use = 1
-        if args.cores > 1: print(f"Warning: Only {total_cpus} core(s) available. Running sequentially.")
+    if available_cores_total <= 1:
+        num_cores_for_pool = 1
+        if args.cores > 1 :
+             print(f"Warning: Only {available_cores_total} core(s) sched_getaffinity reported. Requested {args.cores}. Running with 1 core for pool.")
     else:
-        max_usable_cores = total_cpus - 1
-        num_cores_to_use = min(max(1, args.cores), max_usable_cores)
-        if args.cores > max_usable_cores and args.cores > 1 :
-            print(f"Warning: Requested {args.cores} cores. Capping at {num_cores_to_use} (total available: {total_cpus}).")
+        max_cores_for_pool = available_cores_total - 1
+        num_cores_for_pool = min(max(1, args.cores), max_cores_for_pool)
+        if args.cores > max_cores_for_pool and args.cores > 1:
+            print(f"Warning: Requested {args.cores} cores. Capping at {num_cores_for_pool} for worker pool (available: {available_cores_total}, reserving 1).")
         elif args.cores < 1:
-            print(f"Warning: Requested {args.cores} cores. Using 1 core.")
-            num_cores_to_use = 1
+            print(f"Warning: Requested {args.cores} cores. Using 1 core for pool.")
+            num_cores_for_pool = 1
         
     segment_capillaries_3d_blocks(args.input, args.output,
-                                  args.block_size, args.overlap, num_cores_to_use,
+                                  args.block_size, args.overlap, num_cores_for_pool,
                                   args.save_intermediates,
                                   args.global_intensity_thresh,
                                   args.threshold_method,
