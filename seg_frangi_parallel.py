@@ -15,7 +15,7 @@ DEFAULT_OVERLAP_PIXELS = 16
 DEFAULT_SAVE_INTERMEDIATES = False
 DEFAULT_GLOBAL_INTENSITY_THRESH = 100
 
-FRANGI_SCALE_RANGE = (1, 2)
+FRANGI_SCALE_RANGE = (1, 2) 
 FRANGI_SCALE_STEP = 1
 FRANGI_BETA1 = 0.5
 FRANGI_BETA2 = 15
@@ -31,10 +31,22 @@ MIN_OBJECT_SIZE_VOXELS = 50
 OPENING_RADIUS_PIXELS = 0
 
 # ==============================================================================
-# TOP-LEVEL FUNCTIONS FOR MULTIPROCESSING
+# TOP-LEVEL FUNCTIONS & WORKER INITIALIZER FOR MULTIPROCESSING
 # ==============================================================================
-# process_single_3d_block_mp remains the same
-def process_single_3d_block_mp(input_block_data_with_overlap, params_dict):
+
+_worker_shared_working_volume = None
+
+def init_worker_data(main_volume_data_for_worker):
+    global _worker_shared_working_volume
+    _worker_shared_working_volume = main_volume_data_for_worker
+
+def process_single_3d_block_mp(block_read_slices_tuple, params_dict):
+    global _worker_shared_working_volume
+    if _worker_shared_working_volume is None:
+        raise RuntimeError("Worker process does not have access to the shared working volume.")
+
+    input_block_data_with_overlap = _worker_shared_working_volume[block_read_slices_tuple].copy()
+
     frangi_scales = params_dict['frangi_scales']
     frangi_beta1 = params_dict['frangi_beta1']
     frangi_beta2 = params_dict['frangi_beta2']
@@ -89,6 +101,7 @@ def process_single_3d_block_mp(input_block_data_with_overlap, params_dict):
     
     final_block_segmentation = binary_block
     return final_block_segmentation, enhanced_block_calibrated
+
 # ==============================================================================
 
 # --- Main Segmentation Function ---
@@ -102,7 +115,6 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
                                   arg_fixed_threshold: float,
                                   skeleton_output_path: str = None):
     
-    # ... (Initial printouts and setup as before) ...
     print(f"Starting capillary segmentation for: {input_volume_path}")
     print(f"  Output will be saved to: {output_volume_path}")
     if skeleton_output_path:
@@ -138,7 +150,13 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
         return
     load_time = time.time()
     print(f"Input volume shape (ZYX): {original_volume_zyx.shape}, dtype: {original_volume_zyx.dtype}. Loaded in {load_time - start_time_total:.2f}s.")
+
+    # Critical step for large volumes: The following line will consume a lot of RAM.
+    # Current script assumes working_volume fits in RAM.
+    print(f"Attempting to create working_volume (float32 copy)...") # Added print for this step
     working_volume = original_volume_zyx.astype(np.float32, copy=True)
+    print(f"Working_volume created. Approx. size: {working_volume.nbytes / 1024**3:.2f} GB")
+    del original_volume_zyx
 
     if global_intensity_threshold_val >= 0:
         print(f"Applying global fixed intensity threshold: values < {global_intensity_threshold_val} set to 0...")
@@ -147,7 +165,9 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
         if save_intermediates_flag:
             inter_path = os.path.join(output_dir_inter_skel, f"{input_basename}_01_fixedthreshed.tif")
             print(f"  Saving fixed-thresholded volume to: {inter_path}")
-            tifffile.imwrite(inter_path, working_volume.astype(original_volume_zyx.dtype), imagej=True)
+            # Save as float32 to preserve values accurately after thresholding
+            tifffile.imwrite(inter_path, working_volume.astype(np.float32), imagej=True)
+
 
     if PRE_SMOOTHING_SIGMA_PIXELS is not None and PRE_SMOOTHING_SIGMA_PIXELS > 0:
         print(f"Applying GLOBAL Gaussian pre-smoothing with sigma: {PRE_SMOOTHING_SIGMA_PIXELS} pixels...")
@@ -158,14 +178,16 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
             print(f"  Saving smoothed volume to: {inter_path}")
             tifffile.imwrite(inter_path, working_volume.astype(np.float32), imagej=True)
     
-    output_volume_zyx = np.zeros_like(original_volume_zyx, dtype=np.uint8)
+    # Use shape of working_volume for output array, as original_volume_zyx is deleted
+    output_volume_zyx = np.zeros(working_volume.shape, dtype=np.uint8)
     if save_intermediates_flag:
         full_frangi_response_volume = np.zeros_like(working_volume, dtype=np.float32)
     else:
         full_frangi_response_volume = None
 
     dim_z, dim_y, dim_x = working_volume.shape
-    block_info_list_for_workers = []
+    
+    block_processing_tasks = []
     print("Generating 3D block coordinates for processing...")
     for z_start_orig in range(0, dim_z, block_size_val):
         z_end_orig = min(z_start_orig + block_size_val, dim_z)
@@ -179,13 +201,13 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
                 x_end_orig = min(x_start_orig + block_size_val, dim_x)
                 read_x_start = max(0, x_start_orig - overlap_val)
                 read_x_end = min(dim_x, x_end_orig + overlap_val)
-                input_block_with_overlap = working_volume[
-                    read_z_start:read_z_end,
-                    read_y_start:read_y_end,
-                    read_x_start:read_x_end
-                ].copy()
+                
+                block_read_slices = (slice(read_z_start, read_z_end),
+                                     slice(read_y_start, read_y_end),
+                                     slice(read_x_start, read_x_end))
+                
                 block_info = {
-                    'input_data': input_block_with_overlap,
+                    'read_slices': block_read_slices,
                     'orig_slices_for_stitching': (slice(z_start_orig, z_end_orig),
                                     slice(y_start_orig, y_end_orig),
                                     slice(x_start_orig, x_end_orig)),
@@ -195,9 +217,9 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
                         slice(x_start_orig - read_x_start, (x_start_orig - read_x_start) + (x_end_orig - x_start_orig))
                     )
                 }
-                block_info_list_for_workers.append(block_info)
+                block_processing_tasks.append(block_info)
 
-    num_blocks = len(block_info_list_for_workers)
+    num_blocks = len(block_processing_tasks)
     print(f"Total number of 3D blocks to process: {num_blocks}")
 
     shared_processing_params = {
@@ -210,32 +232,55 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
         'opening_radius': OPENING_RADIUS_PIXELS,
         'min_obj_size': MIN_OBJECT_SIZE_VOXELS,
     }
-    starmap_args = [(bi['input_data'], shared_processing_params) for bi in block_info_list_for_workers]
-    processing_start_time = time.time()
-
-    if num_cores_to_use_for_pool > 1 and num_blocks > 1 :
-        print(f"Processing {num_blocks} blocks in parallel using {num_cores_to_use_for_pool} worker processes...")
-        with multiprocessing.Pool(processes=num_cores_to_use_for_pool) as pool:
-            results_from_workers = pool.starmap(process_single_3d_block_mp, starmap_args)
-    else:
-        if num_cores_to_use_for_pool == 1 : print(f"Processing {num_blocks} blocks sequentially (1 core requested/available for pool)...")
-        else: print(f"Processing {num_blocks} blocks sequentially (single block or no blocks)...")
-        results_from_workers = []
-        for i, (block_data, params_dict) in enumerate(starmap_args):
-            if (i + 1) % (max(1, num_blocks // 10 if num_blocks >=10 else 1)) == 0 or i == num_blocks -1 :
-                 print(f"  Processing block {i+1}/{num_blocks}...")
-            results_from_workers.append(process_single_3d_block_mp(block_data, params_dict))
     
+    starmap_args = [(task_info['read_slices'], shared_processing_params) for task_info in block_processing_tasks]
+
+    processing_start_time = time.time()
+    if num_cores_to_use_for_pool > 0 and num_blocks > 0 :
+        if num_cores_to_use_for_pool > 1 and num_blocks > 1 :
+            print(f"Processing {num_blocks} blocks in parallel using {num_cores_to_use_for_pool} worker processes...")
+            with multiprocessing.Pool(processes=num_cores_to_use_for_pool,
+                                      initializer=init_worker_data,
+                                      initargs=(working_volume,)) as pool:
+                results_from_workers = pool.starmap(process_single_3d_block_mp, starmap_args)
+        else:
+            if num_cores_to_use_for_pool == 1: print(f"Processing {num_blocks} blocks sequentially (1 core for pool)...")
+            else: print(f"Processing {num_blocks} blocks sequentially (single block)...")
+            init_worker_data(working_volume)
+            results_from_workers = []
+            for i, (block_slices, params_dict) in enumerate(starmap_args):
+                if (i + 1) % (max(1, num_blocks // 10 if num_blocks >=10 else 1)) == 0 or i == num_blocks -1 :
+                     print(f"  Processing block {i+1}/{num_blocks}...")
+                results_from_workers.append(process_single_3d_block_mp(block_slices, params_dict))
+            global _worker_shared_working_volume # Clear global for current process
+            _worker_shared_working_volume = None 
+    else:
+        results_from_workers = []
+        print("No blocks to process.")
+
     processing_time = time.time() - processing_start_time
     print(f"All blocks processed in {processing_time:.2f}s.")
+    
+    # Conditionally release working_volume if it's not needed for Frangi intermediate saving
+    # full_frangi_response_volume is initialized based on working_volume.shape, so it's safer
+    # to keep working_volume until after potential saving of full_frangi_response_volume
+    # or ensure full_frangi_response_volume is initialized based on original_volume_zyx.shape if that's preferred.
+    # For now, let's assume it's okay to keep working_volume until the end if intermediates are saved.
+    # If not saving intermediates, we can delete it after processing.
+    if not save_intermediates_flag:
+        del working_volume
+        print("Released main working_volume from memory as intermediates are not saved.")
+
 
     print("Stitching processed blocks...")
     for i, (processed_binary_block_ov, processed_frangi_block_ov) in enumerate(results_from_workers):
-        block_info_for_stitching = block_info_list_for_workers[i]
+        block_info_for_stitching = block_processing_tasks[i]
         orig_slices = block_info_for_stitching['orig_slices_for_stitching']
         crop_slices = block_info_for_stitching['crop_in_block_slices_for_stitching']
+        
         valid_binary_part = processed_binary_block_ov[crop_slices]
         output_volume_zyx[orig_slices] = valid_binary_part
+
         if save_intermediates_flag and full_frangi_response_volume is not None:
             valid_frangi_part = processed_frangi_block_ov[crop_slices]
             full_frangi_response_volume[orig_slices] = valid_frangi_part
@@ -245,13 +290,15 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
         inter_path = os.path.join(output_dir_inter_skel, f"{input_basename}_03_frangi_response.tif")
         print(f"  Saving full Frangi response volume to: {inter_path}")
         tifffile.imwrite(inter_path, full_frangi_response_volume.astype(np.float32), imagej=True)
+        del full_frangi_response_volume # Release after saving
+        print("Released full_frangi_response_volume from memory.")
+
 
     if skeleton_output_path:
         print("Performing 3D skeletonization on the final segmented volume...")
         try:
             skeleton_start_time = time.time()
-            # Use skimage.morphology.skeletonize for 3D data
-            skeleton_volume = skeletonize(output_volume_zyx.astype(bool)) # Changed here
+            skeleton_volume = skeletonize(output_volume_zyx.astype(bool))
             skeleton_volume_uint8 = skeleton_volume.astype(np.uint8) * 255
             skeleton_time = time.time() - skeleton_start_time
             print(f"Skeletonization complete in {skeleton_time:.2f}s.")
@@ -302,7 +349,7 @@ def main():
     parser.add_argument("--fixed_threshold_value", type=float, default=DEFAULT_FIXED_THRESHOLD_VALUE, help=f"Value for fixed threshold. Default: {DEFAULT_FIXED_THRESHOLD_VALUE}")
 
     args = parser.parse_args()
-
+    
     if available_cores_total <= 1:
         num_cores_for_pool = 1
         if args.cores > 1 :
