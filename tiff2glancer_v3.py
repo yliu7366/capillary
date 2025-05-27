@@ -16,7 +16,7 @@ def main():
   parser.add_argument('--voxel-size', type=int, nargs=3, default=[500, 500, 500], metavar=('Z', 'Y', 'X'),
                       help='Voxel size in nanometers (default: 500 500 500)')
   parser.add_argument('--chunk-size', type=int, nargs=3, default=[128, 128, 128], metavar=('Z', 'Y', 'X'),
-                      help='Chunk size (default: 64 64 64)')
+                      help='Chunk size (default: 128 128 128)')
   parser.add_argument('--mip-levels', type=int, default=2, help='Number of mipmap levels (default: 2)')
 
   args = parser.parse_args()

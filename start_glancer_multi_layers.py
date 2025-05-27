@@ -397,7 +397,8 @@ def main():
                 )
             )
         
-        s.layout = 'xy-3d' 
+        # default layout works without setting layout explicitly
+        #s.layout = 'xy-3d'
 
         if vol_for_viewer_properties:
             center_coords_xyz = np.array(vol_for_viewer_properties.shape[:3]) / 2.0
