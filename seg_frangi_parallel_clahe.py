@@ -10,7 +10,7 @@ from skimage.morphology import remove_small_objects, ball, binary_dilation, bina
 from skimage.exposure import equalize_adapthist
 import multiprocessing
 
-# --- Configuration (Defaults, can be overridden by CLI) ---
+# Configuration (Defaults, can be overridden by CLI)
 DEFAULT_BLOCK_SIZE = 196
 DEFAULT_OVERLAP_PIXELS = 36
 DEFAULT_SAVE_INTERMEDIATES = False
@@ -74,8 +74,7 @@ def process_single_3d_block_mp(block_read_slices_tuple, params_dict):
     if enable_clahe:
         kernel_size_isotropic = clahe_kernel_s if clahe_kernel_s % 2 != 0 else clahe_kernel_s + 1
         
-        # make a "empty" mask to remove CLAHE artifacts on all zero areas
-        empty_space_thresh = 1e-3 # A small threshold to consider "effectively zero"
+        empty_space_thresh = 1e-3 
         mask_non_empty = input_block_data_with_overlap > empty_space_thresh
         
         min_val, max_val = np.min(frangi_input), np.max(frangi_input)
@@ -84,7 +83,6 @@ def process_single_3d_block_mp(block_read_slices_tuple, params_dict):
         else:
             clahe_input_norm = np.zeros_like(frangi_input)
         
-        # print(f"    Worker {os.getpid()}: Applying CLAHE, kernel={kernel_size_isotropic}, clip={clahe_clip_limit}, input_range=({min_val:.2f},{max_val:.2f})") # Debug
         frangi_input_clahe = equalize_adapthist(
             clahe_input_norm, 
             kernel_size=kernel_size_isotropic,
@@ -95,7 +93,6 @@ def process_single_3d_block_mp(block_read_slices_tuple, params_dict):
         frangi_input_clahe_masked[~mask_non_empty] = 0
         
         frangi_input = frangi_input_clahe_masked
-        # print(f"    Worker {os.getpid()}: CLAHE done. Min/Max after CLAHE: {np.min(frangi_input):.2f}/{np.max(frangi_input):.2f}") # Debug
     
     enhanced_block_raw_frangi = frangi(
         frangi_input, sigmas=frangi_scales, alpha=0.5, 
@@ -138,7 +135,7 @@ def process_single_3d_block_mp(block_read_slices_tuple, params_dict):
 # ==============================================================================
 
 # --- Main Segmentation Function ---
-def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: str,
+def segment_capillaries_3d_blocks(input_volume_path: str, output_directory: str,
                                   block_size_val: int, overlap_val: int, num_cores_to_use_for_pool: int,
                                   save_intermediates_flag: bool,
                                   global_intensity_threshold_val: int,
@@ -149,13 +146,22 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
                                   arg_enable_clahe: bool,
                                   arg_clahe_kernel_size: int,
                                   arg_clahe_clip_limit: float,
-                                  skeleton_output_path: str = None):
+                                  save_skeleton_flag: bool):
     
     print(f"Starting capillary segmentation for: {input_volume_path}")
-    # ... (Initial printouts, including new CLAHE params) ...
-    print(f"  Output will be saved to: {output_volume_path}")
-    if skeleton_output_path:
-        print(f"  Skeleton output will be saved to: {skeleton_output_path}")
+    
+    input_basename = os.path.splitext(os.path.basename(input_volume_path))[0]
+    os.makedirs(output_directory, exist_ok=True)
+
+    segmentation_output_filepath = os.path.join(output_directory, f"{input_basename}_frangi_seg.tif")
+    skeleton_output_filepath = None
+    if save_skeleton_flag:
+        skeleton_output_filepath = os.path.join(output_directory, f"{input_basename}_skeleton.tif")
+
+    print(f"  Output directory: {output_directory}")
+    print(f"  Segmentation mask will be saved to: {segmentation_output_filepath}")
+    if save_skeleton_flag:
+        print(f"  Skeleton output will be saved to: {skeleton_output_filepath}")
     print(f"  Enable CLAHE: {arg_enable_clahe}")
     if arg_enable_clahe:
         print(f"    CLAHE Kernel Size (isotropic): {arg_clahe_kernel_size}, Clip: {arg_clahe_clip_limit}")
@@ -170,15 +176,6 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
     print(f"  Number of CPU cores for worker pool: {num_cores_to_use_for_pool}")
     print(f"  Save intermediate steps: {save_intermediates_flag}")
     start_time_total = time.time()
-
-    input_basename = os.path.splitext(os.path.basename(input_volume_path))[0]
-    output_dir_main = os.path.dirname(output_volume_path)
-    if not output_dir_main: output_dir_main = "."
-    os.makedirs(output_dir_main, exist_ok=True)
-    output_dir_inter_skel = output_dir_main
-    if skeleton_output_path:
-        skel_dir = os.path.dirname(skeleton_output_path)
-        if skel_dir : os.makedirs(skel_dir, exist_ok=True)
 
     print("Loading input volume...")
     try:
@@ -202,7 +199,7 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
         working_volume[working_volume < global_intensity_threshold_val] = 0
         print("Global fixed intensity threshold applied.")
         if save_intermediates_flag:
-            inter_path = os.path.join(output_dir_inter_skel, f"{input_basename}_01_fixedthreshed.tif")
+            inter_path = os.path.join(output_directory, f"{input_basename}_01_fixedthreshed.tif")
             print(f"  Saving fixed-thresholded volume to: {inter_path}")
             tifffile.imwrite(inter_path, working_volume.astype(np.float32), imagej=True)
 
@@ -212,23 +209,19 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
         working_volume = gaussian_filter(working_volume, sigma=PRE_SMOOTHING_SIGMA_PIXELS, mode='reflect')
         print("Global smoothing complete.")
         if save_intermediates_flag:
-            inter_path = os.path.join(output_dir_inter_skel, f"{input_basename}_02_smoothed.tif")
+            inter_path = os.path.join(output_directory, f"{input_basename}_02_smoothed.tif")
             print(f"  Saving smoothed volume to: {inter_path}")
             tifffile.imwrite(inter_path, working_volume.astype(np.float32), imagej=True)
     
     output_volume_zyx = np.zeros(working_volume.shape, dtype=np.uint8)
     if save_intermediates_flag:
         full_frangi_response_volume = np.zeros_like(working_volume, dtype=np.float32)
-        # We might also want to save the full CLAHE'd volume if enabled
-        # This means process_single_3d_block_mp needs to return it, and we need another array here
-        # For now, focus on Frangi response as the primary "image-like" intermediate from blocks
     else:
         full_frangi_response_volume = None
 
     dim_z, dim_y, dim_x = working_volume.shape
     block_info_list_for_workers = []
     print("Generating 3D block coordinates for processing...")
-    # ... (Block generation as before) ...
     for z_start_orig in range(0, dim_z, block_size_val):
         z_end_orig = min(z_start_orig + block_size_val, dim_z)
         read_z_start = max(0, z_start_orig - overlap_val)
@@ -309,7 +302,6 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
         except NameError: pass
 
     print("Stitching processed blocks...")
-    # ... (Stitching logic as before) ...
     for i, (processed_binary_block_ov, processed_frangi_block_ov) in enumerate(results_from_workers):
         block_info_for_stitching = block_info_list_for_workers[i]
         orig_slices = block_info_for_stitching['orig_slices_for_stitching']
@@ -323,14 +315,13 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
 
 
     if save_intermediates_flag and full_frangi_response_volume is not None:
-        inter_path = os.path.join(output_dir_inter_skel, f"{input_basename}_03_frangi_response.tif")
+        inter_path = os.path.join(output_directory, f"{input_basename}_03_frangi_response.tif")
         print(f"  Saving full Frangi response volume to: {inter_path}")
         tifffile.imwrite(inter_path, full_frangi_response_volume.astype(np.float32), imagej=True)
         del full_frangi_response_volume
         if 'full_frangi_response_volume' in locals() : print("Released full_frangi_response_volume from memory.")
 
-    if skeleton_output_path:
-        # ... (Skeletonization logic as before) ...
+    if save_skeleton_flag and skeleton_output_filepath:
         print("Performing 3D skeletonization on the final segmented volume...")
         try:
             skeleton_start_time = time.time()
@@ -338,20 +329,17 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
             skeleton_volume_uint8 = skeleton_volume.astype(np.uint8) * 255
             skeleton_time = time.time() - skeleton_start_time
             print(f"Skeletonization complete in {skeleton_time:.2f}s.")
-            skel_out_dir_actual = os.path.dirname(skeleton_output_path)
-            if skel_out_dir_actual : os.makedirs(skel_out_dir_actual, exist_ok=True)
-            print(f"Saving skeletonized volume to: {skeleton_output_path}")
-            tifffile.imwrite(skeleton_output_path, skeleton_volume_uint8, imagej=True)
+            print(f"Saving skeletonized volume to: {skeleton_output_filepath}")
+            tifffile.imwrite(skeleton_output_filepath, skeleton_volume_uint8, imagej=True)
             print("Skeleton saved successfully.")
         except MemoryError:
             print("MemoryError during global skeletonization...")
         except Exception as e:
             print(f"Error during skeletonization or saving skeleton: {e}")
 
-    print(f"Saving final segmented volume to: {output_volume_path}")
-    # ... (Saving logic as before) ...
+    print(f"Saving final segmented volume to: {segmentation_output_filepath}")
     try:
-        tifffile.imwrite(output_volume_path, output_volume_zyx, imagej=True)
+        tifffile.imwrite(segmentation_output_filepath, output_volume_zyx, imagej=True)
         print("Segmentation saved successfully.")
     except Exception as e:
         print(f"Error saving output TIFF: {e}")
@@ -361,7 +349,6 @@ def segment_capillaries_3d_blocks(input_volume_path: str, output_volume_path: st
 
 # --- Main Execution ---
 def main():
-    # ... (Determine default_pool_cores using sched_getaffinity as before) ...
     try:
         available_cores_total = len(os.sched_getaffinity(0))
     except AttributeError:
@@ -370,29 +357,27 @@ def main():
     default_pool_cores = max(1, available_cores_total - 1)
 
     parser = argparse.ArgumentParser(description="Capillary vessel segmentation with 3D block processing.")
-    # ... (input, output, skeleton_output, block_size, overlap, cores, save_intermediates args as before) ...
     parser.add_argument("--input", type=str, required=True, help="Path to input 3D TIFF.")
-    parser.add_argument("--output", type=str, required=True, help="Path to save output segmentation TIFF.")
-    parser.add_argument("--skeleton_output", type=str, default=None, help="Optional: Path to save skeleton TIFF.")
+    parser.add_argument("--output", type=str, required=True, help="Output directory for segmentation and skeleton files.")
+    parser.add_argument("--save_skeleton", action='store_true', default=False,
+                        help="Convert segmentation to skeleton and save it. Default: False")
     parser.add_argument("--block_size", type=int, default=DEFAULT_BLOCK_SIZE, help=f"Block size. Default: {DEFAULT_BLOCK_SIZE}")
-    parser.add_argument("--overlap", type=int, default=DEFAULT_OVERLAP_PIXELS, # Uses new default
+    parser.add_argument("--overlap", type=int, default=DEFAULT_OVERLAP_PIXELS, 
                         help=f"Overlap pixels. Default: {DEFAULT_OVERLAP_PIXELS}")
     parser.add_argument("--cores", type=int, default=default_pool_cores,
                         help=f"CPU cores for worker pool. Default: {default_pool_cores} (available_total-1 or 1)")
     parser.add_argument("--save_intermediates", action='store_true', default=DEFAULT_SAVE_INTERMEDIATES, help="Save intermediates. Default: False")
 
-    parser.add_argument("--global_intensity_thresh", type=int, default=DEFAULT_GLOBAL_INTENSITY_THRESH, # Uses new default
+    parser.add_argument("--global_intensity_thresh", type=int, default=DEFAULT_GLOBAL_INTENSITY_THRESH, 
                         help=f"Global intensity threshold (pixels < thresh set to 0). -1 to disable. Default: {DEFAULT_GLOBAL_INTENSITY_THRESH}")
     
-    # CLAHE arguments
-    parser.add_argument("--enable_clahe", action='store_true', default=DEFAULT_ENABLE_CLAHE, # Uses new default
+    parser.add_argument("--enable_clahe", action='store_true', default=DEFAULT_ENABLE_CLAHE, 
                         help=f"Enable CLAHE preprocessing before Frangi. Default: {DEFAULT_ENABLE_CLAHE}")
-    parser.add_argument("--clahe_kernel_size", type=int, default=DEFAULT_CLAHE_KERNEL_SIZE, # Uses new default
+    parser.add_argument("--clahe_kernel_size", type=int, default=DEFAULT_CLAHE_KERNEL_SIZE, 
                         help=f"CLAHE kernel size (isotropic, odd). Default: {DEFAULT_CLAHE_KERNEL_SIZE}")
     parser.add_argument("--clahe_clip_limit", type=float, default=DEFAULT_CLAHE_CLIP_LIMIT,
                         help=f"CLAHE clip limit. Default: {DEFAULT_CLAHE_CLIP_LIMIT}")
 
-    # ... (threshold arguments as before) ...
     parser.add_argument("--threshold_method", type=str, default=DEFAULT_THRESHOLD_METHOD,
                         choices=['otsu', 'hysteresis', 'fixed'], help=f"Threshold method. Default: {DEFAULT_THRESHOLD_METHOD}")
     parser.add_argument("--hysteresis_low", type=float, default=DEFAULT_HYSTERESIS_LOW, help=f"Low for hysteresis. Default: {DEFAULT_HYSTERESIS_LOW}")
@@ -401,20 +386,18 @@ def main():
 
     args = parser.parse_args()
     
-    # ... (Core capping logic based on sched_getaffinity as before) ...
     if available_cores_total <= 1:
         num_cores_for_pool = 1
         if args.cores > 1 :
              print(f"Warning: Only {available_cores_total} core(s) available/sched_getaffinity reported. Requested {args.cores}. Running with 1 core for pool.")
     else:
-        max_cores_for_pool = available_cores_total - 1 # Reserve one core
-        num_cores_for_pool = min(max(1, args.cores), max_cores_for_pool) # Ensure at least 1, and cap at max_usable
-        if args.cores > max_cores_for_pool and args.cores > 1: # User asked for more than usable, and more than 1
+        max_cores_for_pool = available_cores_total - 1 
+        num_cores_for_pool = min(max(1, args.cores), max_cores_for_pool) 
+        if args.cores > max_cores_for_pool and args.cores > 1: 
             print(f"Warning: Requested {args.cores} cores. Capping at {num_cores_for_pool} for worker pool (available via sched_getaffinity: {available_cores_total}, reserving 1).")
-        elif args.cores < 1: # User asked for 0 or negative
+        elif args.cores < 1: 
             print(f"Warning: Requested {args.cores} cores. Using 1 core for pool.")
             num_cores_for_pool = 1
-        # If user request is valid and within cap, it will be used.
         
     segment_capillaries_3d_blocks(args.input, args.output,
                                   args.block_size, args.overlap, num_cores_for_pool,
@@ -427,7 +410,7 @@ def main():
                                   args.enable_clahe,
                                   args.clahe_kernel_size,
                                   args.clahe_clip_limit,
-                                  args.skeleton_output)
+                                  args.save_skeleton)
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
